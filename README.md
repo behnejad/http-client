@@ -1,4 +1,4 @@
-Very simple http client using mongoose library.
+Very simple C http client using mongoose library.
 
 `mongoose.c` and `mongoose.h` in this repository are belong to [mongoose project](https://github.com/cesanta/mongoose).
 
