@@ -14,10 +14,14 @@
 #define HTTP_MAX_HEADERS        40
 #define HTTP_MAX_BUFFER         128000
 
+
 enum {
     HS_STATUS,
     HS_HEADERS,
     HS_PAYLOAD,
+    HS_CHUNK_LEN,
+    HS_CHUNK_VALUE,
+    HS_CHUNK_END,
     HS_DONE,
     HS_ERROR,
 };
@@ -26,18 +30,19 @@ typedef struct {
     char buffer[HTTP_MAX_BUFFER];
     int buffer_index;
     int buffer_size;
-    char * last_line_index;
-    int state;
+    char * last_line;
     char last_byte;
+    int state;
     int content_length;
     int chunked_mode;
+    int last_chunk_len;
     int response_code;
+    int header_count;
+    char * payload;
     struct {
         char * tag;
         char * value;
     } headers[HTTP_MAX_HEADERS];
-    int header_count;
-    char * payload;
 } http_response_t;
 
 void http_response_init(http_response_t * response)
@@ -88,18 +93,51 @@ const char * http_read_chunk_len(const char * ptr, int * out)
 
 int http_parse(http_response_t * response)
 {
+    if (response->buffer_size > sizeof(response->buffer))
+    {
+        return -1;
+    }
+
+    if (response->state == HS_DONE)
+    {
+        return 0;
+    }
+
     while (response->buffer_index < response->buffer_size)
     {
-        int newline = 0;
-        if (response->state == HS_DONE)
+        const char * inja = response->buffer + response->buffer_index;
+        char current_byte = response->buffer[response->buffer_index];
+        int newline = (response->last_byte == '\r' && current_byte == '\n');
+
+        if (response->state == HS_CHUNK_VALUE)
         {
-            return 0;
+            if (response->buffer_index - (response->last_line - response->buffer) == response->last_chunk_len)
+            {
+                response->state = HS_CHUNK_END;
+            }
         }
         else if (response->state == HS_PAYLOAD)
         {
-            if (response->chunked_mode)
+            if (response->content_length == 0 ||
+                response->buffer_index - (response->payload - response->buffer) == response->content_length)
             {
-                if (memcmp(response->buffer + response->buffer_index - 4, "0\r\n\r\n", 5) == 0)
+                // wait until connection closes
+                response->state = HS_DONE;
+                return 0;
+            }
+        }
+        else if (newline)
+        {
+            int update_last_line = 0;
+            if (response->state == HS_CHUNK_LEN)
+            {
+                http_read_chunk_len(response->last_line, &response->last_chunk_len);
+                response->state = HS_CHUNK_VALUE;
+                update_last_line = 1;
+            }
+            else if (response->state == HS_CHUNK_END)
+            {
+                if (response->last_chunk_len == 0)
                 {
                     char * ptr_before = response->payload;
                     const char * ptr_after = ptr_before;
@@ -117,45 +155,40 @@ int http_parse(http_response_t * response)
                     *ptr_before = 0;
                     response->content_length = ptr_before - response->payload;
                     response->state = HS_DONE;
-                    return 0;
+                }
+                else
+                {
+                    response->state = HS_CHUNK_LEN;
+                    update_last_line = 1;
                 }
             }
-            else if (response->content_length == 0)
+            else if (response->buffer_index >= 4 && response->buffer[response->buffer_index - 2] == 0)
             {
-                // wait until connection closes
-                response->state = HS_DONE;
-                return 0;
+                response->payload = response->buffer + response->buffer_index + 1;
+                response->state = response->chunked_mode ? HS_CHUNK_LEN : HS_PAYLOAD;
+
+                update_last_line = 1;
             }
-        }
-        else
-        {
-            newline = (response->buffer[response->buffer_index] == '\n' && response->last_byte == '\r');
-
-            if (newline)
+            else if (response->state == HS_STATUS)
             {
-                if (response->buffer_index >= 4 && response->buffer[response->buffer_index - 2] == 0)
+                char * s = strchr(response->buffer, ' ');
+                if (s == NULL)
                 {
-                    response->payload = response->buffer + response->buffer_index + 1;
-                    response->state = HS_PAYLOAD;
+                    response->state = HS_ERROR;
+                    return -1;
                 }
-                else if (response->state == HS_STATUS)
-                {
-                    response->state = HS_HEADERS;
 
-                    char * s = strchr(response->buffer, ' ');
-                    if (s == NULL)
-                    {
-                        response->state = HS_ERROR;
-                        return -1;
-                    }
+                response->response_code = http_read_int(s + 1);
+                response->state = HS_HEADERS;
 
-                    response->response_code = http_read_int(s + 1);
-                    response->state = HS_HEADERS;
-                }
-                else if (response->state == HS_HEADERS && response->header_count < HTTP_MAX_HEADERS)
+                update_last_line = 1;
+            }
+            else if (response->state == HS_HEADERS)
+            {
+                if (response->header_count < HTTP_MAX_HEADERS)
                 {
-                    response->headers[response->header_count].tag = response->last_line_index;
-                    char * s = strchr(response->last_line_index, ':');
+                    response->headers[response->header_count].tag = response->last_line;
+                    char * s = strchr(response->last_line, ':');
                     if (s == NULL)
                     {
                         response->state = HS_ERROR;
@@ -172,39 +205,32 @@ int http_parse(http_response_t * response)
 
                     s++;
                     response->headers[response->header_count].value = s;
-                    if (strcasecmp(response->last_line_index, "Content-Length") == 0)
+                    if (strcasecmp(response->last_line, "Content-Length") == 0)
                     {
                         response->content_length = http_read_int(s);
                     }
-                    else if (strcasecmp(response->last_line_index, "Transfer-Encoding") == 0 &&
-                             strncasecmp(s, "chunked", 7) == 0)
+                    else if (strcasecmp(response->last_line, "Transfer-Encoding") == 0 &&
+                             memcmp(s, "chunked", 7) == 0)
                     {
                         response->chunked_mode = 1;
                     }
 
                     response->header_count++;
                 }
+
+                update_last_line = 1;
+            }
+
+            if (update_last_line)
+            {
+                response->buffer[response->buffer_index] = 0;
+                response->buffer[response->buffer_index - 1] = 0;
+                response->last_line = response->buffer + response->buffer_index + 1;
             }
         }
 
-        response->last_byte = response->buffer[response->buffer_index];
+        response->last_byte = current_byte;
         response->buffer_index++;
-
-        if (newline)
-        {
-            response->buffer[response->buffer_index - 1] = 0;
-            response->buffer[response->buffer_index - 2] = 0;
-            response->last_line_index = response->buffer + response->buffer_index;
-        }
-    }
-
-    if (response->content_length != 0 && response->chunked_mode == 0)
-    {
-        if (response->buffer_index - (response->payload - response->buffer) >= response->content_length)
-        {
-            response->state = HS_DONE;
-            return 0;
-        }
     }
 
     return 1;
@@ -424,7 +450,54 @@ const char * data[] = {
         "1\r\n\n\r\n"
         "11\r\npashmak gholikhan\r\n"
         "000\r\n\r\n",
+
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        "Referrer-Policy: no-referrer\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Date: Mon, 25 Sep 2023 06:10:49 GMT\r\n"
+        "\r\n"
+        "10\r\n[[\r\nxx1>0\r\n\r\n<]]\r\n"
+        "5\r\nsalam\r\n"
+        "1\r\n\n\r\n"
+        "11\r\npashmak gholikhan\r\n"
+        "000\r\n\r\n",
 };
+
+//#include "cJSON.h"
+//cJSON * cJSON_FindObject(cJSON * root, const char * tag)
+//{
+//    cJSON * elem;
+//    if (root == NULL)
+//        return NULL;
+//    else if (root->type == cJSON_Array) {
+//        int i = 0;
+//        for (i = 0; i < cJSON_GetArraySize(root); ++i) {
+//            elem = cJSON_GetArrayItem(root, i);
+//            if (elem) {
+//                elem = cJSON_FindObject(elem, tag);
+//                if (elem)
+//                    return elem;
+//            } else
+//                return NULL;
+//        }
+//    }
+//    else if (root->type == cJSON_Object) {
+//        elem = cJSON_GetObjectItem(root, tag);
+//        if (elem)
+//            return elem;
+//        elem = root->child;
+//        while (elem) {
+//            if (elem->type == cJSON_Array || elem->type == cJSON_Object) {
+//                cJSON * temp = cJSON_FindObject(elem, tag);
+//                if (temp)
+//                    return temp;
+//            }
+//            elem = elem->next;
+//        }
+//    }
+//    return NULL;
+//}
 
 int main1() {
     http_response_t hs;
