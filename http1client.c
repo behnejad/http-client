@@ -155,6 +155,7 @@ int http_parse(http_response_t * response)
                     *ptr_before = 0;
                     response->content_length = ptr_before - response->payload;
                     response->state = HS_DONE;
+                    return 0;
                 }
                 else
                 {
